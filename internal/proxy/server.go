@@ -113,6 +113,26 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "invalid JSON body: "+err.Error())
 		return
 	}
+
+	// 2026-11-23: 打印会【影响会话复用】的请求头,用于确认调用方(如 new-api)
+	// 到底有没有把对话标识传下来 —— 没有的话,同一个客户的多次请求可能被
+	// 当成同一个会话(或反过来,每次都是新会话,丢掉 cache 复用)。
+	{
+		h := r.Header
+		pick := func(k string) string {
+			v := strings.TrimSpace(h.Get(k))
+			if v == "" {
+				return "-"
+			}
+			if len(v) > 40 {
+				v = v[:40] + "..."
+			}
+			return v
+		}
+		log.Printf("[HDR] conv=%s thread=%s session=%s user=%s reqid=%s ua=%q",
+			pick("X-Conversation-Id"), pick("X-Thread-Id"), pick("X-Session-Id"),
+			pick("X-User-Id"), pick("X-Request-Id"), pick("User-Agent"))
+	}
 	if req.N > 1 {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", "n > 1 is not supported")
 		return

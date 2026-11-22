@@ -12,3 +12,4 @@ dist/
 # Local artifacts
 page-signup.png
 *.log
+config.docker.json

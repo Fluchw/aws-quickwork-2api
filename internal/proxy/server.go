@@ -68,7 +68,14 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	created := time.Now().Unix()
-	data := make([]map[string]any, 0, len(s.cfg.Models))
+	// 2026-11-23:除了档位名,同时广告【真实模型名】,调用方可以直接用。
+	// 映射实测自 turn_usage.resolved_model_id。
+	realOf := map[string]string{
+		"smart":    "claude-opus-5-5",
+		"balanced": "claude-sonnet-5-5",
+		"fast":     "claude-haiku-5-5",
+	}
+	data := make([]map[string]any, 0, len(s.cfg.Models)*2)
 	for _, id := range s.cfg.Models {
 		data = append(data, map[string]any{
 			"id":       id,
@@ -76,6 +83,16 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			"created":  created,
 			"owned_by": "quickwork",
 		})
+		// 真实模型名作为别名一并列出(客户端可直接用它)
+		if real, ok := realOf[id]; ok {
+			data = append(data, map[string]any{
+				"id":       real,
+				"object":   "model",
+				"created":  created,
+				"owned_by": "anthropic",
+				"alias_of": id,
+			})
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
@@ -251,7 +268,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
 				status, code = http.StatusBadRequest, "request_too_large"
 			}
-			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
+			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, res, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
@@ -273,7 +290,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		toolCalls := replyToolCalls(replies)
 		if !hasVisibleText(text) && len(toolCalls) == 0 {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, res, errEmpty)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
 			return
 		}
@@ -290,7 +307,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
-		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
+		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), res, nil)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
@@ -448,11 +465,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			case errors.Is(lastErr, ErrUserMessageTooLarge):
 				status, code = http.StatusBadRequest, "request_too_large"
 			}
-			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
+			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, res, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
-		logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
+		logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, res, lastErr)
 		writeStreamError(lastErr.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
@@ -481,7 +498,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			finish = "tool_calls"
 		} else if !hasVisibleText(outText) {
 			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, res, errEmpty)
 			writeStreamError(errEmpty.Error())
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
@@ -489,7 +506,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	} else if !sawVisibleText {
 		errEmpty := fmt.Errorf("upstream returned no visible text (completion_tokens=%d)", res.Usage.CompletionTokens)
-		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, res, errEmpty)
 		writeStreamError(errEmpty.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
@@ -510,7 +527,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}}}, nil)
 	}
 	writeChunk(map[string]any{}, finish)
-	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), nil)
+	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), res, nil)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		writePayload(map[string]any{
 			"id":      id,
@@ -543,12 +560,14 @@ func accountLogLabel(a *store.Account) string {
 
 // logChatDone emits one completion line per chat request with the outcome,
 // selected account, mapped model, token usage, finish reason, and error.
-func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, toolCalls int, err error) {
+func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, toolCalls int, res ChatResult, err error) {
 	if finish == "" {
 		finish = "-"
 	}
-	line := fmt.Sprintf("chat %s done status=%s account=%s model=%s attempts=%d elapsed=%s tokens{prompt=%d completion=%d total=%d cache_read=%d cache_write=%d} finish=%s tool_calls=%d",
-		id, status, accountLogLabel(acct), in.Model, attempts, time.Since(startedAt).Round(time.Millisecond),
+	// 2026-11-23:额外打印 would-be 真实模型与成本(从 turn_usage 拿到),
+	// 这样日志里能直接看出 "model=fast 实际跑的是 haiku-5-5、花了多少钱"。
+	line := fmt.Sprintf("chat %s done status=%s account=%s model=%s resolved=%s cost=$%.6f attempts=%d elapsed=%s tokens{prompt=%d completion=%d total=%d cache_read=%d cache_write=%d} finish=%s tool_calls=%d",
+		id, status, accountLogLabel(acct), in.Model, res.ResolvedModel, res.CostUSD, attempts, time.Since(startedAt).Round(time.Millisecond),
 		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CacheReadTokens, u.CacheWriteTokens, finish, toolCalls)
 	if err != nil {
 		log.Printf("%s error=%v", line, err)
@@ -576,6 +595,28 @@ func (s *Server) mapModel(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	m = strings.TrimPrefix(m, "quickwork/")
 	m = strings.TrimPrefix(m, "qw-")
+	// 2026-11-23:客户端可以用【真实模型名】直接指定档位。
+	// 实测各档位对应的上游模型(从 turn_usage.resolved_model_id 抓到的):
+	//   smart    -> us.anthropic.claude-opus-5-5
+	//   balanced -> us.anthropic.claude-sonnet-5-5
+	//   fast     -> us.anthropic.claude-haiku-5-5
+	// 所以这里把真实模型名映射回档位名,调用方不用记"哪个档是哪档"。
+	// 只取最后一段(去掉 us./anthropic/ 等厂商前缀),并容忍 claude- 前缀缺失。
+	alias := m
+	if i := strings.LastIndex(alias, "/"); i >= 0 {
+		alias = alias[i+1:]
+	}
+	alias = strings.TrimPrefix(alias, "us.")
+	alias = strings.TrimPrefix(alias, "eu.")
+	alias = strings.TrimPrefix(alias, "anthropic.")
+	switch alias {
+	case "claude-opus-5-5", "opus-5-5", "opus", "claude-opus":
+		return "smart"
+	case "claude-sonnet-5-5", "sonnet-5-5", "sonnet", "claude-sonnet":
+		return "balanced"
+	case "claude-haiku-5-5", "haiku-5-5", "haiku", "claude-haiku":
+		return "fast"
+	}
 	switch m {
 	case "smart", "fast", "balanced", "auto":
 		return m

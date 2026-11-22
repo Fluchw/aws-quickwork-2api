@@ -86,6 +86,10 @@ type ChatResult struct {
 	ToolCalls []ToolCallState
 	Usage     Usage
 	ThreadID  string
+	// 2026-11-23: 上游 turn_usage 返回的真实模型 / 成本 / 上下文窗口
+	ResolvedModel string
+	CostUSD       float64
+	ContextWindow int
 }
 
 // Chat sends one prompt through the QuickWork chat bidi WebSocket. Text
@@ -542,12 +546,19 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 			sawMessageComplete = true
 		case "turn_usage":
+			// 2026-11-23:上游 turn_usage 里带了真实模型与成本,一并解析出来 ——
+			// 之前只取了 token 数,把 resolved_model_id 丢掉了,导致我们一直不知道
+			// "fast/balanced/smart 分别是什么模型"(实测:haiku-5-5 / sonnet-5-5 / opus-5-5)。
 			var p struct {
-				InputTokens      int `json:"input_tokens"`
-				OutputTokens     int `json:"output_tokens"`
-				TotalTokens      int `json:"total_tokens"`
-				CacheReadTokens  int `json:"cache_read_tokens"`
-				CacheWriteTokens int `json:"cache_write_tokens"`
+				InputTokens      int     `json:"input_tokens"`
+				OutputTokens     int     `json:"output_tokens"`
+				TotalTokens      int     `json:"total_tokens"`
+				CacheReadTokens  int     `json:"cache_read_tokens"`
+				CacheWriteTokens int     `json:"cache_write_tokens"`
+				Model            string  `json:"model"`
+				ResolvedModelID  string  `json:"resolved_model_id"`
+				CostUSD          float64 `json:"cost_usd"`
+				ContextWindow    int     `json:"context_window"`
 			}
 			if err := json.Unmarshal(env.Payload, &p); err == nil {
 				result.Usage.add(Usage{
@@ -557,6 +568,16 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 					CacheReadTokens:  p.CacheReadTokens,
 					CacheWriteTokens: p.CacheWriteTokens,
 				})
+				// 2026-11-23: 记录真实模型/成本,日志一眼看清走的哪档
+				if p.ResolvedModelID != "" {
+					result.ResolvedModel = p.ResolvedModelID
+				} else if p.Model != "" {
+					result.ResolvedModel = p.Model
+				}
+				result.CostUSD += p.CostUSD
+				if p.ContextWindow > 0 {
+					result.ContextWindow = p.ContextWindow
+				}
 			}
 		case "tool_start", "tool_arguments", "tool_arguments_edited":
 			var p struct {

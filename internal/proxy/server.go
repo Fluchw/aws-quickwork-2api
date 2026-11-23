@@ -213,7 +213,45 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d prompt_chars=%d system_chars=%d reuse=%t thread=%q",
 		id, requestedModel, model, req.Stream, len(req.Messages), len(promptText), len(systemPromptText), resume, in.ThreadID)
 
+	// 2026-11-23(用户要求):支持【指定账号】生成。
+	//   X-QuickWork-Account: <email>   按邮箱钉号
+	//   X-QuickWork-Account-Id: <id>   按 id 钉号
+	// ⚠️ 钉的号不存在/被禁用 → 400 直接报错,【绝不静默回落轮询】——
+	//    否则调用方以为在用 A 号,实际跑在 B 号上,账和调试全乱。
+	pinnedEmail := strings.TrimSpace(r.Header.Get("X-QuickWork-Account"))
+	pinnedIDStr := strings.TrimSpace(r.Header.Get("X-QuickWork-Account-Id"))
+	var pinned *store.Account
+	if pinnedEmail != "" || pinnedIDStr != "" {
+		var perr error
+		if pinnedEmail != "" {
+			pinned, perr = s.accounts.PinnedByEmail(ctx, pinnedEmail)
+		} else {
+			var pid int64
+			if _, e := fmt.Sscanf(pinnedIDStr, "%d", &pid); e != nil || pid <= 0 {
+				writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+					"X-QuickWork-Account-Id must be a positive integer")
+				return
+			}
+			pinned, perr = s.accounts.NextPinned(ctx, pid)
+		}
+		if perr != nil || pinned == nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("pinned account not found: %s%s", pinnedEmail, pinnedIDStr))
+			return
+		}
+		if pinned.Disabled {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error",
+				fmt.Sprintf("pinned account %d is disabled", pinned.ID))
+			return
+		}
+		log.Printf("chat %s pinned account -> %s", id, accountLogLabel(pinned))
+	}
+
 	selectAccount := func(attempt int) (*store.Account, error) {
+		// 指定账号优先(且不重试换号:钉的是哪个就用哪个)
+		if pinned != nil {
+			return pinned, nil
+		}
 		if resume && attempt == 1 && conv.accountID != 0 {
 			acct, err := s.accounts.NextPinned(ctx, conv.accountID)
 			if err == nil {

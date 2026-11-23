@@ -76,6 +76,16 @@ func (m *Manager) Next(ctx context.Context) (*store.Account, error) {
 	return nil, fmt.Errorf("no usable account: %s", strings.Join(errs, "; "))
 }
 
+// PinnedByEmail returns one specific account identified by email, refreshing it
+// when needed. Used by the X-QuickWork-Account pin header.
+func (m *Manager) PinnedByEmail(ctx context.Context, email string) (*store.Account, error) {
+	a, err := m.store.ByEmail(ctx, email)
+	if err != nil {
+		return nil, err
+	}
+	return m.NextPinned(ctx, a.ID)
+}
+
 // NextPinned returns one specific account, refreshing it when needed. It is
 // used to keep a conversation on the account that owns its upstream session.
 func (m *Manager) NextPinned(ctx context.Context, id int64) (*store.Account, error) {

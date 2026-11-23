@@ -294,6 +294,15 @@ func (s *Store) Get(ctx context.Context, id int64) (*Account, error) {
 	return scanAccount(row)
 }
 
+// ByEmail returns the account with the given email (case-insensitive),
+// or sql.ErrNoRows when absent. Used by the X-QuickWork-Account pin header.
+func (s *Store) ByEmail(ctx context.Context, email string) (*Account, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+columns+` FROM accounts WHERE LOWER(email)=LOWER(?) ORDER BY id DESC LIMIT 1`,
+		strings.TrimSpace(email))
+	return scanAccount(row)
+}
+
 // Delete removes one account.
 func (s *Store) Delete(ctx context.Context, id int64) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id=?`, id)

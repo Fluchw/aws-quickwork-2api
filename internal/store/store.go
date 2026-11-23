@@ -297,10 +297,51 @@ func (s *Store) Get(ctx context.Context, id int64) (*Account, error) {
 // ByEmail returns the account with the given email (case-insensitive),
 // or sql.ErrNoRows when absent. Used by the X-QuickWork-Account pin header.
 func (s *Store) ByEmail(ctx context.Context, email string) (*Account, error) {
+	want := canonicalEmail(email)
+	// 先精确匹配(大小写不敏感),再按 canonical 形式在 Go 侧比对。
+	// ⚠️ 2026-11-23 踩过:库里存的是【带点的原始邮箱】(mainw.aringkilmer960@gmail.com),
+	//    而调用方传的是去点的 canonical(mainwaringkilmer960@gmail.com) → 精确匹配查不到。
+	//    SQL 里没法做 gmail 去点,所以退化到取回候选再比对。
 	row := s.db.QueryRowContext(ctx,
 		`SELECT `+columns+` FROM accounts WHERE LOWER(email)=LOWER(?) ORDER BY id DESC LIMIT 1`,
 		strings.TrimSpace(email))
-	return scanAccount(row)
+	if a, err := scanAccount(row); err == nil {
+		return a, nil
+	} else if err != sql.ErrNoRows {
+		return nil, err
+	}
+	// 退化:把候选邮箱都取出来做 canonical 比对(数量级只有几十~几百,可接受)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+columns+` FROM accounts ORDER BY id DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		a, err := scanAccount(rows)
+		if err != nil {
+			return nil, err
+		}
+		if canonicalEmail(a.Email) == want {
+			return a, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+// canonicalEmail normalizes an email for comparison: lowercase + Gmail dot
+// stripping (CLAUDE.md #8). It deliberately does NOT strip +suffix.
+func canonicalEmail(e string) string {
+	s := strings.ToLower(strings.TrimSpace(e))
+	at := strings.LastIndex(s, "@")
+	if at <= 0 {
+		return s
+	}
+	local, domain := s[:at], s[at+1:]
+	if domain == "gmail.com" || domain == "googlemail.com" {
+		local = strings.ReplaceAll(local, ".", "")
+		domain = "gmail.com"
+	}
+	return local + "@" + domain
 }
 
 // Delete removes one account.
